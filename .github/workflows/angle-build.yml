@@ -183,3 +183,41 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.tar.gz
+
+  bundle-all:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Bundle all platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(cat "$GITHUB_WORKSPACE/REVISION")"
+          safe_rev="${rev#refs/heads/}"
+          safe_rev="${safe_rev#refs/tags/}"
+          safe_rev="${safe_rev//\//-}"
+          bundle="angle-all-${safe_rev}.tar.gz"
+          mkdir -p dist/all
+          find dist -type f -name '*.tar.gz' -exec cp {} dist/all/ \;
+          tar -C dist -czf "dist/${bundle}" all
+
+      - name: Upload bundled artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-all-${{ github.ref_name }}
+          path: dist/angle-all-*.tar.gz
+          if-no-files-found: error
+
+      - name: Publish bundled artifact to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/angle-all-*.tar.gz
