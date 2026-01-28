@@ -1,0 +1,185 @@
+name: build-angle-libs
+
+on:
+  push:
+    branches:
+      - main
+      - ci-tests
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up depot_tools
+        shell: bash
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+          echo "$(pwd)/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch ANGLE
+        shell: bash
+        run: |
+          REVISION="$(cat "$GITHUB_WORKSPACE/REVISION")"
+          mkdir -p angle
+          cd angle
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://chromium.googlesource.com/angle/angle.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {},
+              "revision": "REVISION_PLACEHOLDER",
+            },
+          ]
+          EOF
+          sed -i.bak "s#REVISION_PLACEHOLDER#${REVISION}#g" .gclient
+          rm -rf _bad_scm
+          gclient sync --no-history --revision ".@${REVISION}" --reset
+      - name: Make static libs distributable
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            git -C angle config core.autocrlf false
+            git -C angle checkout -- .
+          fi
+          git -C angle apply --check --ignore-whitespace --ignore-space-change \
+            "$GITHUB_WORKSPACE/patches/angle-static-libs.patch"
+          git -C angle apply --ignore-whitespace --ignore-space-change \
+            "$GITHUB_WORKSPACE/patches/angle-static-libs.patch"
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd angle
+          sudo ./build/install-build-deps.sh --no-prompt
+          build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
+
+      - name: Prepare Xcode (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo xcodebuild -runFirstLaunch || true
+
+      - name: Generate build files (non-Windows)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd angle
+          gn gen out/Release --args='is_debug=false is_component_build=false'
+
+      - name: Generate build files (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd angle
+          sdk_root="/c/Program Files (x86)/Windows Kits/10/Include"
+          required_sdk="10.0.26100.0"
+          echo "Available Windows SDKs:"
+          ls "$sdk_root" || true
+          if [ ! -d "$sdk_root/$required_sdk" ]; then
+            echo "Required Windows SDK ${required_sdk} not found under ${sdk_root}."
+            exit 1
+          fi
+          echo "Using Windows SDK ${required_sdk}"
+          gn gen out/Release --args="is_debug=false is_component_build=false windows_sdk_version=\"${required_sdk}\""
+
+      - name: Build shared + static libs
+        shell: bash
+        run: |
+          cd angle
+          autoninja -C out/Release libEGL libGLESv2 libGLESv2_static
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd angle
+          mkdir -p ../dist
+          out_dir="out/Release"
+          rev="$(cat "$GITHUB_WORKSPACE/REVISION")"
+          safe_rev="${rev#refs/heads/}"
+          safe_rev="${safe_rev#refs/tags/}"
+          safe_rev="${safe_rev//\//-}"
+          pkg="angle-${{ runner.os }}-${safe_rev}"
+          staging="../dist/${pkg}"
+          mkdir -p "${staging}"
+          case "${RUNNER_OS}" in
+            Linux)
+              for f in libEGL libGLESv2; do
+                [ -f "${out_dir}/${f}.so" ] && cp "${out_dir}/${f}.so" "${staging}/"
+              done
+              if [ -f "${out_dir}/libGLESv2_static.a" ]; then
+                cp "${out_dir}/libGLESv2_static.a" "${staging}/"
+              elif [ -f "${out_dir}/obj/libGLESv2_static.a" ]; then
+                cp "${out_dir}/obj/libGLESv2_static.a" "${staging}/"
+              fi
+              ;;
+            macOS)
+              for f in libEGL libGLESv2; do
+                [ -f "${out_dir}/${f}.dylib" ] && cp "${out_dir}/${f}.dylib" "${staging}/"
+              done
+              if [ -f "${out_dir}/libGLESv2_static.a" ]; then
+                cp "${out_dir}/libGLESv2_static.a" "${staging}/"
+              elif [ -f "${out_dir}/obj/libGLESv2_static.a" ]; then
+                cp "${out_dir}/obj/libGLESv2_static.a" "${staging}/"
+              fi
+              ;;
+            Windows)
+              for f in libEGL libGLESv2; do
+                [ -f "${out_dir}/${f}.dll" ] && cp "${out_dir}/${f}.dll" "${staging}/"
+                [ -f "${out_dir}/${f}.lib" ] && cp "${out_dir}/${f}.lib" "${staging}/"
+              done
+              if [ -f "${out_dir}/libGLESv2_static.lib" ]; then
+                cp "${out_dir}/libGLESv2_static.lib" "${staging}/"
+              elif [ -f "${out_dir}/obj/libGLESv2_static.lib" ]; then
+                cp "${out_dir}/obj/libGLESv2_static.lib" "${staging}/"
+              fi
+              ;;
+          esac
+          if [ -d "include" ]; then
+            cp -R "include" "${staging}/"
+          fi
+          if [ -f "LICENSE" ]; then
+            cp "LICENSE" "${staging}/"
+          fi
+          tar -C ../dist -czf "../dist/${pkg}.tar.gz" "${pkg}"
+
+      - name: Set artifact name
+        shell: bash
+        run: |
+          rev="$(cat "$GITHUB_WORKSPACE/REVISION")"
+          safe_rev="${rev#refs/heads/}"
+          safe_rev="${safe_rev#refs/tags/}"
+          safe_rev="${safe_rev//\//-}"
+          echo "ARTIFACT_NAME=angle-${RUNNER_OS}-${safe_rev}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
