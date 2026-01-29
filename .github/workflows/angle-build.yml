@@ -12,14 +12,107 @@ on:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - label: linux-x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: x64
+            sysroot: amd64
+            vulkan: false
+          - label: linux-x64-vulkan
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: x64
+            sysroot: amd64
+            vulkan: true
+          - label: linux-x86
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: x86
+            sysroot: i386
+            vulkan: false
+          - label: linux-x86-vulkan
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: x86
+            sysroot: i386
+            vulkan: true
+          - label: linux-arm64
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: arm64
+            sysroot: arm64
+            vulkan: false
+          - label: linux-arm64-vulkan
+            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: arm64
+            sysroot: arm64
+            vulkan: true
+          - label: macos-arm64
+            runner: macos-14
+            target_os: mac
+            target_cpu: arm64
+            vulkan: false
+          - label: macos-arm64-vulkan
+            runner: macos-14
+            target_os: mac
+            target_cpu: arm64
+            vulkan: true
+          - label: macos-x64
+            runner: macos-15-intel
+            target_os: mac
+            target_cpu: x64
+            vulkan: false
+          - label: macos-x64-vulkan
+            runner: macos-15-intel
+            target_os: mac
+            target_cpu: x64
+            vulkan: true
+          - label: windows-x86
+            runner: windows-latest
+            target_os: win
+            target_cpu: x86
+            vulkan: false
+          - label: windows-x86-vulkan
+            runner: windows-latest
+            target_os: win
+            target_cpu: x86
+            vulkan: true
+          - label: windows-x64
+            runner: windows-latest
+            target_os: win
+            target_cpu: x64
+            vulkan: false
+          - label: windows-x64-vulkan
+            runner: windows-latest
+            target_os: win
+            target_cpu: x64
+            vulkan: true
+          - label: windows-arm64
+            runner: windows-latest
+            target_os: win
+            target_cpu: arm64
+            vulkan: false
+          - label: windows-arm64-vulkan
+            runner: windows-latest
+            target_os: win
+            target_cpu: arm64
+            vulkan: true
+          - label: ios-arm64
+            runner: macos-14
+            target_os: ios
+            target_cpu: arm64
+            vulkan: false
 
     env:
       DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      TARGET_OS: ${{ matrix.target_os }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
 
     steps:
       - name: Checkout repo
@@ -63,6 +156,19 @@ jobs:
             "$GITHUB_WORKSPACE/patches/angle-static-libs.patch"
           git -C angle apply --ignore-whitespace --ignore-space-change \
             "$GITHUB_WORKSPACE/patches/angle-static-libs.patch"
+      - name: Patch build repo (Windows arm64 dbghelp)
+        shell: bash
+        run: |
+          if [ -d "angle/build/.git" ]; then
+            if [ "${RUNNER_OS}" = "Windows" ]; then
+              git -C angle/build config core.autocrlf false
+              git -C angle/build checkout -- .
+            fi
+            git -C angle/build apply --check --ignore-whitespace --ignore-space-change \
+              "$GITHUB_WORKSPACE/patches/build-win-skip-debugger-dlls.patch"
+            git -C angle/build apply --ignore-whitespace --ignore-space-change \
+              "$GITHUB_WORKSPACE/patches/build-win-skip-debugger-dlls.patch"
+          fi
 
       - name: Install Linux deps
         if: runner.os == 'Linux'
@@ -70,7 +176,7 @@ jobs:
         run: |
           cd angle
           sudo ./build/install-build-deps.sh --no-prompt
-          build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
+          build/linux/sysroot_scripts/install-sysroot.py --arch=${{ matrix.sysroot }}
 
       - name: Prepare Xcode (macOS)
         if: runner.os == 'macOS'
@@ -83,7 +189,19 @@ jobs:
         shell: bash
         run: |
           cd angle
-          gn gen out/Release --args='is_debug=false is_component_build=false'
+          args='is_debug=false is_component_build=false symbol_level=0 target_cpu="${{ matrix.target_cpu }}" target_os="${{ matrix.target_os }}"'
+          if [ "${TARGET_OS}" = "ios" ]; then
+            args="${args} ios_enable_code_signing=false target_environment=\"device\""
+          fi
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            args="${args} mac_sdk_version=\"14.5\" mac_sdk_min=\"14.0\""
+          fi
+          if [ "${{ matrix.vulkan }}" = "true" ]; then
+            args="${args} angle_enable_vulkan=true angle_enable_vulkan_system_info=true"
+          else
+            args="${args} angle_enable_vulkan=false angle_enable_vulkan_system_info=false"
+          fi
+          gn gen out/Release --args="${args}"
 
       - name: Generate build files (Windows)
         if: runner.os == 'Windows'
@@ -99,13 +217,22 @@ jobs:
             exit 1
           fi
           echo "Using Windows SDK ${required_sdk}"
-          gn gen out/Release --args="is_debug=false is_component_build=false windows_sdk_version=\"${required_sdk}\""
+          args="is_debug=false is_component_build=false symbol_level=0 target_cpu=\"${{ matrix.target_cpu }}\" windows_sdk_version=\"${required_sdk}\""
+          if [ "${TARGET_CPU}" = "arm64" ]; then
+            args="${args} dawn_use_built_dxc=false"
+          fi
+          if [ "${{ matrix.vulkan }}" = "true" ]; then
+            args="${args} angle_enable_vulkan=true angle_enable_vulkan_system_info=true"
+          else
+            args="${args} angle_enable_vulkan=false angle_enable_vulkan_system_info=false"
+          fi
+          gn gen out/Release --args="${args}"
 
       - name: Build shared + static libs
         shell: bash
         run: |
           cd angle
-          autoninja -C out/Release libEGL libGLESv2 libGLESv2_static
+          autoninja -C out/Release libEGL libGLESv2 libGLESv2_static libEGL_static
 
       - name: Package artifacts
         shell: bash
@@ -118,7 +245,7 @@ jobs:
           safe_rev="${rev#refs/heads/}"
           safe_rev="${safe_rev#refs/tags/}"
           safe_rev="${safe_rev//\//-}"
-          pkg="angle-${{ runner.os }}-${safe_rev}"
+          pkg="angle-${{ matrix.label }}-${safe_rev}"
           staging="../dist/${pkg}"
           mkdir -p "${staging}"
           case "${RUNNER_OS}" in
@@ -133,13 +260,23 @@ jobs:
               fi
               ;;
             macOS)
-              for f in libEGL libGLESv2; do
-                [ -f "${out_dir}/${f}.dylib" ] && cp "${out_dir}/${f}.dylib" "${staging}/"
-              done
-              if [ -f "${out_dir}/libGLESv2_static.a" ]; then
-                cp "${out_dir}/libGLESv2_static.a" "${staging}/"
-              elif [ -f "${out_dir}/obj/libGLESv2_static.a" ]; then
-                cp "${out_dir}/obj/libGLESv2_static.a" "${staging}/"
+              if [ "${TARGET_OS}" = "ios" ]; then
+                for f in libEGL_static libGLESv2_static; do
+                  if [ -f "${out_dir}/${f}.a" ]; then
+                    cp "${out_dir}/${f}.a" "${staging}/"
+                  elif [ -f "${out_dir}/obj/${f}.a" ]; then
+                    cp "${out_dir}/obj/${f}.a" "${staging}/"
+                  fi
+                done
+              else
+                for f in libEGL libGLESv2; do
+                  [ -f "${out_dir}/${f}.dylib" ] && cp "${out_dir}/${f}.dylib" "${staging}/"
+                done
+                if [ -f "${out_dir}/libGLESv2_static.a" ]; then
+                  cp "${out_dir}/libGLESv2_static.a" "${staging}/"
+                elif [ -f "${out_dir}/obj/libGLESv2_static.a" ]; then
+                  cp "${out_dir}/obj/libGLESv2_static.a" "${staging}/"
+                fi
               fi
               ;;
             Windows)
@@ -169,7 +306,7 @@ jobs:
           safe_rev="${rev#refs/heads/}"
           safe_rev="${safe_rev#refs/tags/}"
           safe_rev="${safe_rev//\//-}"
-          echo "ARTIFACT_NAME=angle-${RUNNER_OS}-${safe_rev}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=angle-${{ matrix.label }}-${safe_rev}" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -208,11 +345,12 @@ jobs:
           mkdir -p dist/all
           find dist -type f -name '*.tar.gz' -exec cp {} dist/all/ \;
           tar -C dist -czf "dist/${bundle}" all
+          echo "ALL_BUNDLE_NAME=angle-all-${safe_rev}" >> "$GITHUB_ENV"
 
       - name: Upload bundled artifact
         uses: actions/upload-artifact@v4
         with:
-          name: angle-all-${{ github.ref_name }}
+          name: ${{ env.ALL_BUNDLE_NAME }}
           path: dist/angle-all-*.tar.gz
           if-no-files-found: error
 
