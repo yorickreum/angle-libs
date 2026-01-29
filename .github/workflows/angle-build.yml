@@ -1,5 +1,8 @@
 name: build-angle-libs
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
@@ -12,6 +15,7 @@ on:
 
 jobs:
   build:
+    if: github.event_name != 'release' || github.event.release.target_commitish == 'main'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -323,6 +327,7 @@ jobs:
 
   bundle-all:
     needs: build
+    if: github.event_name != 'release' || github.event.release.target_commitish == 'main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
